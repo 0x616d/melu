@@ -1,0 +1,25 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Publish
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup ko
+        uses: ko-build/setup-ko@d006021bd0c28d1ce33a07e7943d48b079944c8d # v0.9
+
+      - name: Publish image
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: ko build --bare --platform all -t "${REF_NAME//v/}" ./cmd/melu
