@@ -145,7 +145,7 @@ func (o *Options) Update(ctx context.Context) error {
 				bump.WithExpectedCommit(latest.Commit),
 			),
 		); err != nil {
-			o.Logger.Printf("renovate %s: %s", packageName, err)
+			o.Logger.Printf("renovate %s: %s\n", packageName, err)
 			continue
 		}
 
@@ -176,9 +176,18 @@ func (o *Options) Update(ctx context.Context) error {
 	}
 
 	if gho := os.Getenv("GITHUB_OUTPUT"); gho != "" {
-		if f, err := os.OpenFile(gho, os.O_WRONLY, 0644); err == nil {
-			fmt.Fprintf(f, "packages=%s", strings.Join(updatedPackages, ","))
-		}		
+		o.Logger.Printf("writing updated packages to %s:\n", gho)
+		
+		f, err := os.OpenFile(gho, os.O_WRONLY, 0644);
+		if err != nil {
+			return err
+		}
+
+		_, err = fmt.Fprintf(f, "packages=%s\n", strings.Join(updatedPackages, ","))
+		if err != nil {
+			return err
+
+		}
 	}
 
 	return repo.Push(&git.PushOptions{Auth: auth})
@@ -188,10 +197,9 @@ func (o *Options) GetLatestVersions(ctx context.Context, dir string) (map[string
 	var err error
 	latestVersions := make(map[string]NewVersionResults)
 
-	pkgs := make(map[string]*melange.Packages)
 	o.PackageConfigs = make(map[string]*melange.Packages)
 
-	pkgs, err = melange.ReadPackageConfigs(ctx, o.PackageNames, filepath.Join(dir, o.PackagePath))
+	pkgs, err := melange.ReadPackageConfigs(ctx, o.PackageNames, filepath.Join(dir, o.PackagePath))
 	if err != nil {
 		return nil, fmt.Errorf("unable to get package configs: %w", err)
 	}
@@ -203,7 +211,7 @@ func (o *Options) GetLatestVersions(ctx context.Context, dir string) (map[string
 	}
 
 	if len(o.PackageConfigs) < 1 {
-		o.Logger.Printf("no package updates")
+		o.Logger.Printf("no packages with updates enabled found\n")
 		return nil, nil
 	}
 
