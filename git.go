@@ -5,53 +5,42 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
-	"chainguard.dev/melange/pkg/renovate"
-	"github.com/dprotaso/go-yit"
-	"github.com/wolfi-dev/wolfictl/pkg/melange"
+	"github.com/0x616d/melu/internal/melange"
 
 	git "github.com/go-git/go-git/v5"
 	gitplumbing "github.com/go-git/go-git/v5/plumbing"
+	gitobject "github.com/go-git/go-git/v5/plumbing/object"
 )
 
 type GitService struct {
-	packages map[string]*melange.Packages
-	repos    map[string]*gitCheckoutOpts
+	packages map[string]*melange.Package
 }
 
-func NewGitService(pkgs map[string]*melange.Packages) *GitService {
-	p := make(map[string]*melange.Packages)
-	r := make(map[string]*gitCheckoutOpts)
+func NewGitService(pkgs map[string]*melange.Package) *GitService {
+	p := make(map[string]*melange.Package)
 
 	for pkgName, pkg := range pkgs {
 		if pkg.Config.Update.GitMonitor == nil {
 			continue
 		}
 
-		// packages must contain _git in the version to be updated by the Git updater
-		if !strings.Contains(pkg.Config.Package.Version, "_git") {
+		if _, err := findGitCheckoutOptions(pkg); err != nil {
 			continue
 		}
 
-		checkoutOpts, err := getGitChechoutOpts(pkg)
-		if err != nil {
-			continue
-		}
-
-		r[pkgName] = checkoutOpts
 		p[pkgName] = pkg
 	}
 
-	return &GitService{packages: p, repos: r}
+	return &GitService{packages: p}
 }
 
 func (o *GitService) GetLatestVersions() (map[string]NewVersionResults, error) {
 	versions := make(map[string]NewVersionResults)
 
 	for pkgName := range o.packages {
-		v, err := o.getLatestVersion(o.packages[pkgName], o.repos[pkgName])
+		v, err := o.getLatestVersion(o.packages[pkgName])
 		if err != nil {
 			return versions, err
 		}
@@ -62,29 +51,37 @@ func (o *GitService) GetLatestVersions() (map[string]NewVersionResults, error) {
 	return versions, nil
 }
 
-func (o *GitService) getLatestVersion(pkg *melange.Packages, checkoutOpts *gitCheckoutOpts) (NewVersionResults, error) {
+func (o *GitService) getLatestVersion(pkg *melange.Package) (NewVersionResults, error) {
 	cloneDir := filepath.Join(os.TempDir(), "melu"+pkg.Config.Package.Name)
 
-	r, err := git.PlainClone(cloneDir, false, &git.CloneOptions{URL: checkoutOpts.Repository, Depth: checkoutOpts.Depth})
+	checkoutOpts, _ := findGitCheckoutOptions(pkg)
+
+	repo, _ := checkoutOpts["repository"]
+
+	r, err := git.PlainClone(cloneDir, false, &git.CloneOptions{URL: repo})
 	if err != nil {
 		return NewVersionResults{}, err
 	}
-
 	defer os.RemoveAll(cloneDir)
 
-	var refName gitplumbing.ReferenceName
+	if _, ok := checkoutOpts["tag"]; ok {
+		gm := pkg.Config.Update.GitMonitor
 
-	switch {
-	case checkoutOpts.Tag != "":
-		refName = gitplumbing.ReferenceName("refs/tags/" + checkoutOpts.Tag)
-	case checkoutOpts.Branch != "":
-		refName = gitplumbing.ReferenceName("refs/heads/" + checkoutOpts.Branch)
+		tag, err := o.getLatestTagFromRepo(r, gm.TagFilterPrefix, gm.TagFilterContains)
+		if err != nil {
+			return NewVersionResults{}, err
+		}
+
+		return NewVersionResults{
+			Version: o.prepareVersion(pkg.Config.Package.Name, tag.Name),
+			Commit:  tag.Hash.String(),
+		}, nil
 	}
 
 	var ref *gitplumbing.Reference
 
-	if refName != "" {
-		ref, err = r.Reference(refName, false)
+	if branch, ok := checkoutOpts["branch"]; ok {
+		ref, err = r.Reference(gitplumbing.ReferenceName("refs/heads/"+branch), false)
 	} else {
 		ref, err = r.Head()
 	}
@@ -98,67 +95,89 @@ func (o *GitService) getLatestVersion(pkg *melange.Packages, checkoutOpts *gitCh
 		return NewVersionResults{}, err
 	}
 
-	parts := strings.Split(pkg.Config.Package.Version, "_git")
+	version := strings.Split(pkg.Config.Package.Version, "_git")[0]
+	if version == "" {
+		version = "0"
+	}
 
 	return NewVersionResults{
-		Version: fmt.Sprintf("%s_git%s", parts[0], commit.Author.When.Format("20060102")),
+		Version: fmt.Sprintf("%s_git%s", version, commit.Committer.When.Format("20060102")),
 		Commit:  commit.Hash.String(),
 	}, nil
 }
 
-type gitCheckoutOpts struct {
-	Repository string
-	Branch     string
-	Tag        string
-	Depth      int
-}
-
-func getGitChechoutOpts(pkg *melange.Packages) (*gitCheckoutOpts, error) {
-	cfg := pkg.Config
-
-	pipelineNode, err := renovate.NodeFromMapping(cfg.Root().Content[0], "pipeline")
+func (o *GitService) getLatestTagFromRepo(r *git.Repository, filterPrefix, filterContains string) (*gitobject.Tag, error) {
+	tags, err := r.TagObjects()
 	if err != nil {
 		return nil, err
 	}
 
-	it := yit.FromNode(pipelineNode).
-		RecurseNodes().
-		Filter(yit.WithMapValue("git-checkout"))
+	var latestTag *gitobject.Tag
+	var latestTagCommit *gitobject.Commit
 
-	gitCheckoutNode, ok := it()
-	if !ok {
+	err = tags.ForEach(func(tag *gitobject.Tag) error {
+		commit, err := tag.Commit()
+		if err != nil {
+			return err
+		}
+
+		if filterPrefix != "" && !strings.HasPrefix(tag.Name, filterPrefix) {
+			return nil
+		}
+
+		if filterContains != "" && !strings.Contains(tag.Name, filterContains) {
+			return nil
+		}
+
+		if latestTagCommit == nil {
+			latestTag = tag
+			latestTagCommit = commit
+			return nil
+		}
+
+		if commit.Committer.When.After(latestTagCommit.Author.When) {
+			latestTag = tag
+			latestTagCommit = commit
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return latestTag, nil
+}
+
+func (o *GitService) prepareVersion(packageName, v string) string {
+	gm := o.packages[packageName].Config.Update.GitMonitor
+
+	if gm.StripPrefix != "" {
+		v = strings.TrimPrefix(v, gm.StripPrefix)
+	}
+
+	if gm.StripSuffix != "" {
+		v = strings.TrimSuffix(v, gm.StripSuffix)
+	}
+
+	return v
+}
+
+func findGitCheckoutOptions(pkg *melange.Package) (map[string]string, error) {
+	if len(pkg.Config.Pipeline) == 0 {
+		return nil, fmt.Errorf("no pipelines found in %s package", pkg.Config.Package.Name)
+	}
+
+	p := pkg.Config.Pipeline[0]
+
+	if p.Uses != "git-checkout" {
 		return nil, errors.New("no git-checkout step in pipeline")
 	}
 
-	withNode, err := renovate.NodeFromMapping(gitCheckoutNode, "with")
-	if err != nil {
-		return nil, errors.New("git-checkout without options")
-	}
-
-	repository, err := renovate.NodeFromMapping(withNode, "repository")
-	if err != nil {
+	if _, ok := p.With["repository"]; !ok {
 		return nil, errors.New("no repository defined in git-checkout")
 	}
 
-	checkout := &gitCheckoutOpts{Repository: repository.Value}
-
-	if branch, err := renovate.NodeFromMapping(withNode, "branch"); err == nil {
-		checkout.Branch = branch.Value
-	}
-
-	if tag, err := renovate.NodeFromMapping(withNode, "tag"); err == nil {
-		checkout.Tag = tag.Value
-	}
-
-	if depth, err := renovate.NodeFromMapping(withNode, "depth"); err == nil {
-		if d, err := strconv.Atoi(depth.Value); err == nil {
-			checkout.Depth = d
-		} else {
-			checkout.Depth = -1
-		}
-	} else {
-		checkout.Depth = -1
-	}
-
-	return checkout, nil
+	return p.With, nil
 }

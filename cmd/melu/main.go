@@ -1,39 +1,89 @@
 package main
 
 import (
-	"context"
+	"encoding/csv"
 	"flag"
-	"net/url"
+	"log"
+	"maps"
+	"os"
 
 	"github.com/0x616d/melu"
+	"github.com/0x616d/melu/internal/melange"
 )
 
 func main() {
-	u := melu.New()
+	var (
+		queryGit    bool
+		queryGitHub bool
+		queryAnitya bool
+	)
 
-	flag.BoolVar(&u.GitQuery, "query-git", false, "query git repositories for latest releases")
-	flag.BoolVar(&u.GitHubQuery, "query-github", false, "query https://api.github.com/graphql API for latest releases")
-	flag.BoolVar(&u.AnityaQuery, "query-anitya", false, "query https://release-monitoring.org API for latest releases")
-	flag.BoolVar(&u.Push, "push", false, "push changes")
-	flag.BoolVar(&u.Clean, "clean", true, "delete temporary cloned repository")
-	flag.StringVar(&u.RepoBranch, "branch", "master", "repository branch")
-	flag.StringVar(&u.PackagePath, "path", "", "path in the git repo containing the melange yaml files")
-
+	flag.BoolVar(&queryGit, "query-git", false, "query git repositories for latest releases")
+	flag.BoolVar(&queryGitHub, "query-github", false, "query https://api.github.com/graphql API for latest releases")
+	flag.BoolVar(&queryAnitya, "query-anitya", false, "query https://release-monitoring.org API for latest releases")
 	flag.Parse()
 
-	if flag.NArg() < 1 {
-		u.Logger.Fatalf("usage: melu [flag]... repository\n")
+	if flag.NArg() == 0 {
+		flag.Usage()
+		return
 	}
 
-	repoURI := flag.Arg(0)
-
-	if _, err := url.ParseRequestURI(repoURI); err != nil {
-		u.Logger.Fatalf("parse repository URI %s: %s\n", repoURI, err)
+	pkgs, err := melange.ReadPackageConfigs(flag.Args())
+	if err != nil {
+		log.Fatalf("read packages: %s\n", err)
 	}
 
-	u.RepoURI = repoURI
+	latestVersions := make(map[string]melu.NewVersionResults)
 
-	if err := u.Update(context.Background()); err != nil {
-		u.Logger.Fatalln(err)
+	if !queryGit && !queryGitHub && !queryAnitya {
+		log.Fatalf("no services from where to fetch latests versions\n")
 	}
+
+	if queryGit {
+		s := melu.NewGitService(pkgs)
+		v, err := s.GetLatestVersions()
+		if err != nil {
+			log.Fatalf("get git repositories versions: %s\n", err)
+		}
+		maps.Copy(latestVersions, v)
+	}
+
+	if queryGitHub {
+		s, err := melu.NewGitHubService(pkgs)
+		if err != nil {
+			log.Fatalf("new github service: %s\n", err)
+		}
+		v, err := s.GetLatestVersions()
+		if err != nil {
+			log.Fatalf("get latest github tag/releases: %s\n", err)
+		}
+		maps.Copy(latestVersions, v)
+	}
+
+	if queryAnitya {
+		s := melu.NewAnityaService(pkgs)
+		v, err := s.GetLatestVersions()
+		if err != nil {
+			log.Fatalf("get release monitor versions: %s\n", err)
+		}
+		maps.Copy(latestVersions, v)
+	}
+
+	w := csv.NewWriter(os.Stdout)
+
+	for packageName, latest := range latestVersions {
+		pkg := pkgs[packageName]
+
+		if err := w.Write([]string{
+			pkg.File,
+			pkg.Config.Package.Name,
+			pkg.Config.Package.Version,
+			latest.Version,
+			latest.Commit,
+		}); err != nil {
+			log.Fatalf("csv write: %s\n", err)
+		}
+	}
+
+	w.Flush()
 }

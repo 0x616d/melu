@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
+	"log"
 	"maps"
 	"net/http"
 	"os"
@@ -13,24 +14,17 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/wolfi-dev/wolfictl/pkg/melange"
-	"golang.org/x/time/rate"
+	"github.com/0x616d/melu/internal/melange"
+	"github.com/0x616d/melu/internal/rlhttp"
 
-	whttp "github.com/wolfi-dev/wolfictl/pkg/http"
+	"golang.org/x/time/rate"
 )
 
 // Git SHA should be 40 hexadecimal chars
 var gitShaRe = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 
-var gitHubTmplFn = template.FuncMap{
-	"dec": func(n int) int {
-		return n - 1
-	},
-}
-
-var gitHubTagsQueryTmpl = template.Must(template.New("").Funcs(gitHubTmplFn).Parse(`
+var gitHubTagsQueryTmpl = template.Must(template.New("").Parse(`
 query {
-{{- $max := dec (len .RepoList) }}
 {{- range  $index, $r := .RepoList }}
 	r{{$r.PackageHash}}: repository(owner: "{{$r.Owner}}", name: "{{$r.Name}}") {
 		refs(refPrefix: "refs/tags/", query: "{{$r.Filter}}", orderBy: {field: TAG_COMMIT_DATE, direction: DESC}, first: 1) {
@@ -41,14 +35,13 @@ query {
 				}
 			}
 		}
-	}{{ if lt $index $max }},{{ end }}
+	}
 {{- end }}
 }
 `)).Option("missingkey=error")
 
-var gitHubReleasesQueryTmpl = template.Must(template.New("").Funcs(gitHubTmplFn).Parse(`
+var gitHubReleasesQueryTmpl = template.Must(template.New("").Parse(`
 query {
-{{- $max := dec (len .RepoList) }}
 {{- range $index, $r := .RepoList }}
 	r{{$r.PackageHash}}: repository(owner: "{{$r.Owner}}", name: "{{$r.Name}}") {
 		latestRelease {
@@ -57,7 +50,7 @@ query {
 				commitUrl
 			}
 		}
-	}{{ if lt $index $max }},{{ end }}
+	}
 {{- end }}
 }
 `)).Option("missingkey=error")
@@ -87,8 +80,8 @@ type gitHubTags struct {
 }
 
 type GitHubService struct {
-	client       *whttp.RLHTTPClient
-	packages     map[string]*melange.Packages
+	client       *rlhttp.RLHTTPClient
+	packages     map[string]*melange.Package
 	packagesMap  map[string]string
 	repoReleases []RepoInfo
 	repoTags     []RepoInfo
@@ -101,23 +94,20 @@ type RepoInfo struct {
 	PackageHash string
 }
 
-func NewGitHubService(pkgs map[string]*melange.Packages) (*GitHubService, error) {
+func NewGitHubService(pkgs map[string]*melange.Package) (*GitHubService, error) {
 	t := os.Getenv("GITHUB_TOKEN")
 	if t == "" {
 		return nil, fmt.Errorf("no GITHUB_TOKEN environment variable found, required by GitHub GraphQL API")
 	}
 
 	s := &GitHubService{
-		client: &whttp.RLHTTPClient{
+		client: &rlhttp.RLHTTPClient{
 			Ratelimiter: rate.NewLimiter(rate.Every(5*time.Second), 1),
 			Client: &http.Client{
-				Transport: &AuthTransport{
-					Transport:     http.DefaultTransport,
-					Authorization: fmt.Sprintf("bearer %s", t),
-				},
+				Transport: NewAuthTransport(http.DefaultTransport, fmt.Sprintf("bearer %s", t)),
 			},
 		},
-		packages:    make(map[string]*melange.Packages),
+		packages:    make(map[string]*melange.Package),
 		packagesMap: make(map[string]string),
 	}
 
@@ -238,7 +228,7 @@ func (o *GitHubService) getTagsVersions() (map[string]NewVersionResults, error) 
 	return results, nil
 }
 
-func (o *GitHubService) getRepoInfo(p *melange.Packages) (RepoInfo, error) {
+func (o *GitHubService) getRepoInfo(p *melange.Package) (RepoInfo, error) {
 	m := p.Config.Update.GitHubMonitor
 
 	parts := strings.Split(m.Identifier, "/")
@@ -285,6 +275,7 @@ func (o *GitHubService) doGraphQLQuery(query string, response any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log.Println(query)
 		return fmt.Errorf("non ok http response for github graphql code: %s", resp.Status)
 	}
 

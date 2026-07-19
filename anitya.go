@@ -8,38 +8,35 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wolfi-dev/wolfictl/pkg/melange"
 	"golang.org/x/time/rate"
 
-	whttp "github.com/wolfi-dev/wolfictl/pkg/http"
+	"github.com/0x616d/melu/internal/melange"
+	"github.com/0x616d/melu/internal/rlhttp"
 )
 
 type AnityaService struct {
-	client   *whttp.RLHTTPClient
-	packages map[string]*melange.Packages
+	client   *rlhttp.RLHTTPClient
+	packages map[string]*melange.Package
 }
 
-func NewAnityaService(pkgs map[string]*melange.Packages) *AnityaService {
-	var c *whttp.RLHTTPClient
+func NewAnityaService(pkgs map[string]*melange.Package) *AnityaService {
+	var c *rlhttp.RLHTTPClient
 
 	if t := os.Getenv("ANITYA_TOKEN"); t != "" {
-		c = &whttp.RLHTTPClient{
+		c = &rlhttp.RLHTTPClient{
 			Ratelimiter: rate.NewLimiter(rate.Every(1*time.Second/2), 1),
 			Client: &http.Client{
-				Transport: &AuthTransport{
-					Transport:     http.DefaultTransport,
-					Authorization: fmt.Sprintf("token %s", t),
-				},
+				Transport: NewAuthTransport(http.DefaultTransport, fmt.Sprintf("token %s", t)),
 			},
 		}
 	} else {
-		c = &whttp.RLHTTPClient{
+		c = &rlhttp.RLHTTPClient{
 			Ratelimiter: rate.NewLimiter(rate.Every(5*time.Second), 1),
 			Client:      http.DefaultClient,
 		}
 	}
 
-	p := make(map[string]*melange.Packages)
+	p := make(map[string]*melange.Package)
 
 	for pkgName, pkg := range pkgs {
 		if pkg.Config.Update.ReleaseMonitor.Identifier < 1 {
@@ -67,7 +64,7 @@ func (o *AnityaService) GetLatestVersions() (map[string]NewVersionResults, error
 	return versions, nil
 }
 
-func (o *AnityaService) getLatestVersion(packageName string) (string, error) {	
+func (o *AnityaService) getLatestVersion(packageName string) (string, error) {
 	id := o.packages[packageName].Config.Update.ReleaseMonitor.Identifier
 
 	url := fmt.Sprintf("https://release-monitoring.org/api/v2/versions/?project_id=%d", id)
@@ -90,7 +87,7 @@ func (o *AnityaService) getLatestVersion(packageName string) (string, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("")
+		return "", fmt.Errorf("%d when getting %d", resp.StatusCode, id)
 	}
 
 	var version struct {
